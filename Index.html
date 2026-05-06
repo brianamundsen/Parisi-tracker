@@ -1,0 +1,342 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Parisi Speed School — Athlete Tracker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080c14;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;overflow:hidden;font-size:14px}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#0f172a}::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+input,select,textarea,button{font-family:inherit;font-size:13px;color:#e2e8f0}
+input::placeholder,textarea::placeholder{color:#475569}
+.card{background:#0e1829;border:1px solid #1e3a5f;border-radius:12px;padding:16px 18px}
+.btn-p{background:linear-gradient(135deg,#2563eb,#1d4ed8);border:none;border-radius:9px;padding:11px 26px;color:#fff;font-size:14px;font-weight:800;cursor:pointer}
+.btn-g{background:transparent;border:1px solid #334155;border-radius:9px;padding:11px 22px;color:#94a3b8;font-size:14px;font-weight:600;cursor:pointer}
+.tab-btn{background:none;border:none;padding:11px 18px;font-weight:700;cursor:pointer;color:#64748b;border-bottom:2px solid transparent;font-size:13px;letter-spacing:.04em}
+.tab-btn.active{color:#60a5fa;border-bottom-color:#60a5fa}
+.prog-wrap{background:#1e293b;border-radius:99px;height:5px;overflow:hidden;margin-top:5px}
+.prog{height:100%;border-radius:99px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:7px 11px;text-align:left;font-weight:700;font-size:10px;letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid #1e293b}
+td{padding:7px 11px;border-bottom:1px solid #1a2535}
+.spinner{width:32px;height:32px;border:3px solid #1e293b;border-top-color:#60a5fa;border-radius:50%;animation:spin .7s linear infinite;margin:0 auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+.IS{width:100%;background:#0b1220;border:1px solid #1e3a5f;border-radius:8px;padding:9px 12px;color:#e2e8f0;outline:none;font-size:13px;font-family:inherit}
+.step{display:flex;gap:14px;align-items:flex-start;padding:14px 0;border-bottom:1px solid #1a2535}
+.step:last-child{border-bottom:none}
+.stepn{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;font-weight:800;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div id="root" style="height:100vh;display:flex;flex-direction:column"><div style="flex: 1 1 0%; overflow-y: auto; padding: 28px; max-width: 600px; margin: 0px auto; width: 100%;"><div style="width: 48px; height: 48px; background: linear-gradient(135deg, rgb(37, 99, 235), rgb(29, 78, 216)); border-radius: 11px; display: flex; align-items: center; justify-content: center; font-size: 24px; margin-bottom: 14px;">⚡</div><div style="font-size: 26px; font-weight: 800; color: rgb(241, 245, 249); margin-bottom: 4px;">Connect Your Database</div><p style="color: rgb(100, 116, 139); font-size: 13px; margin-bottom: 24px;">One-time setup. Once done, your whole team shares the same live data.</p><div style="background: rgb(14, 24, 41); border: 1px solid rgb(30, 58, 95); border-radius: 14px; padding: 20px 22px; margin-bottom: 20px;"><div style="font-size: 12px; font-weight: 800; color: rgb(96, 165, 250); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 10px;">Step-by-Step Setup</div><div class="step" style=""><div class="stepn" style="">1</div><div><div style="font-weight: 700; color: rgb(226, 232, 240); margin-bottom: 3px;">Go to JSONBin.io</div><p style="font-size: 12px; color: rgb(148, 163, 184); line-height: 1.6;">Open <strong>jsonbin.io</strong> in your browser and create a free account.</p></div></div><div class="step" style=""><div class="stepn" style="">2</div><div><div style="font-weight: 700; color: rgb(226, 232, 240); margin-bottom: 3px;">Create a Bin</div><p style="font-size: 12px; color: rgb(148, 163, 184); line-height: 1.6;">Click <strong>+ New Bin</strong>. Paste this as the content, then click Create:<br><code style="background:#0b1220;padding:2px 7px;border-radius:5px;font-size:11px;color:#60a5fa">{"athletes":[]}</code></p></div></div><div class="step" style=""><div class="stepn" style="">3</div><div><div style="font-weight: 700; color: rgb(226, 232, 240); margin-bottom: 3px;">Copy your Bin ID</div><p style="font-size: 12px; color: rgb(148, 163, 184); line-height: 1.6;">After creating, copy the <strong>Bin ID</strong> shown in the URL or dashboard.</p></div></div><div class="step" style=""><div class="stepn" style="">4</div><div><div style="font-weight: 700; color: rgb(226, 232, 240); margin-bottom: 3px;">Get your API Key</div><p style="font-size: 12px; color: rgb(148, 163, 184); line-height: 1.6;">Go to <strong>Account → API Keys</strong> and copy your <strong>Master Key</strong>.</p></div></div><div class="step" style=""><div class="stepn" style="">5</div><div><div style="font-weight: 700; color: rgb(226, 232, 240); margin-bottom: 3px;">Paste both below</div><p style="font-size: 12px; color: rgb(148, 163, 184); line-height: 1.6;">Enter your Bin ID and Master Key, then click Connect.</p></div></div></div><div style="background: rgb(14, 24, 41); border: 1px solid rgb(30, 58, 95); border-radius: 14px; padding: 20px 22px; margin-bottom: 16px;"><div style="font-size: 12px; font-weight: 800; color: rgb(96, 165, 250); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 10px;">Your Credentials</div><div style="margin-bottom: 12px;"><div style="font-size: 10px; color: rgb(100, 116, 139); font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; margin-bottom: 3px;">Bin ID</div><input class="IS" placeholder="e.g. 64a3f2c9e3a..." style="width: 100%; background: rgb(11, 18, 32); border: 1px solid rgb(30, 58, 95); border-radius: 8px; padding: 9px 12px; color: rgb(226, 232, 240); outline: none; font-size: 13px; font-family: inherit;"></div><div><div style="font-size: 10px; color: rgb(100, 116, 139); font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; margin-bottom: 3px;">Master Key</div><input class="IS" type="password" placeholder="$2b$10$..." style="width: 100%; background: rgb(11, 18, 32); border: 1px solid rgb(30, 58, 95); border-radius: 8px; padding: 9px 12px; color: rgb(226, 232, 240); outline: none; font-size: 13px; font-family: inherit;"></div></div><div style="color: rgb(248, 113, 113); font-size: 12px; margin-bottom: 10px; background: rgba(248, 113, 113, 0.1); border: 1px solid rgba(248, 113, 113, 0.3); border-radius: 8px; padding: 8px 13px; display: none;"></div><button style="background: rgb(30, 41, 59); border: 1px solid rgb(51, 65, 85); border-radius: 9px; padding: 12px; color: rgb(148, 163, 184); font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; margin-bottom: 10px;">⬇ Download HTML File</button><button style="background: linear-gradient(135deg, rgb(37, 99, 235), rgb(29, 78, 216)); border-width: medium; border-style: none; border-color: currentcolor; border-image: initial; border-radius: 9px; padding: 12px 28px; color: rgb(255, 255, 255); font-size: 14px; font-weight: 800; cursor: pointer; width: 100%;">Connect &amp; Load Data</button></div></div>
+<script>
+"use strict";
+
+/* ══ STANDARDS ══════════════════════════════════════════════════════ */
+var STD=[
+  {g:"Boys",t:"10 yd split",a:"9-11", d:"L",ex:2.1, go:2.15,av:2.2, ba:2.3 },
+  {g:"Boys",t:"10 yd split",a:"12-14",d:"L",ex:1.95,go:2,   av:2.05,ba:2.15},
+  {g:"Boys",t:"10 yd split",a:"15-17",d:"L",ex:1.85,go:1.9, av:1.95,ba:2.1 },
+  {g:"Boys",t:"10 yd split",a:"18-19",d:"L",ex:1.75,go:1.85,av:1.9, ba:2.05},
+  {g:"Boys",t:"20 yd split",a:"9-11", d:"L",ex:3.5, go:3.6, av:3.8, ba:4.1 },
+  {g:"Boys",t:"20 yd split",a:"12-14",d:"L",ex:3.15,go:3.3, av:3.5, ba:3.8 },
+  {g:"Boys",t:"20 yd split",a:"15-17",d:"L",ex:3.05,go:3.15,av:3.35,ba:3.7 },
+  {g:"Boys",t:"20 yd split",a:"18-19",d:"L",ex:2.95,go:3.1, av:3.3, ba:3.6 },
+  {g:"Boys",t:"40 yd dash", a:"9-11", d:"L",ex:5.8, go:6.2, av:6.6, ba:7   },
+  {g:"Boys",t:"40 yd dash", a:"12-14",d:"L",ex:5.3, go:5.6, av:5.9, ba:6.3 },
+  {g:"Boys",t:"40 yd dash", a:"15-17",d:"L",ex:4.8, go:5.2, av:5.6, ba:6   },
+  {g:"Boys",t:"40 yd dash", a:"18-19",d:"L",ex:4.7, go:5,   av:5.3, ba:5.6 },
+  {g:"Boys",t:"Vertical Jump",a:"9-11", d:"H",ex:16,go:15,av:13,ba:11},
+  {g:"Boys",t:"Vertical Jump",a:"12-14",d:"H",ex:21,go:19,av:17,ba:14},
+  {g:"Boys",t:"Vertical Jump",a:"15-17",d:"H",ex:25,go:23,av:21,ba:19},
+  {g:"Boys",t:"Vertical Jump",a:"18-19",d:"H",ex:28,go:27,av:25,ba:23},
+  {g:"Boys",t:"3 Hop Test",a:"9-11", d:"H",ex:19.2,go:17.4,av:15.6,ba:14.4},
+  {g:"Boys",t:"3 Hop Test",a:"12-14",d:"H",ex:21.6,go:20.4,av:18.6,ba:16.8},
+  {g:"Boys",t:"3 Hop Test",a:"15-17",d:"H",ex:25.8,go:23.4,av:21.0,ba:18.0},
+  
